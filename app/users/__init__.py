@@ -1,0 +1,1 @@
+"""User identity persistence package."""

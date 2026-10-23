@@ -152,6 +152,13 @@ activemq-data/
 # Environments
 .env
 .envrc
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
 .venv
 env/
 venv/
