@@ -5,16 +5,18 @@ on:
     branches: [main]
     tags: ["v*.*.*"]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  test-and-build:
+  build-and-test:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check out source
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -30,52 +32,69 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Check Terraform formatting
-        run: terraform fmt -check -recursive infra/terraform
-
-      - name: Initialize Terraform providers
-        run: terraform -chdir=infra/terraform init -backend=false
-
-      - name: Validate Terraform configuration
-        run: terraform -chdir=infra/terraform validate
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build container image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          tags: comments-api:ci
-
-  publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: test-and-build
+  terraform-validate:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+
     steps:
-      - name: Check out source
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+
+      - name: Terraform fmt check
+        run: terraform -chdir=infra/terraform fmt -check -recursive
+
+      - name: Terraform init (no backend, no Azure calls)
+        run: terraform -chdir=infra/terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform -chdir=infra/terraform validate
+
+  docker-build-push:
+    needs: [build-and-test, terraform-validate]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Publish versioned container image
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: lynxelele/comments-api
+          tags: |
+            type=raw,value=stable,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
