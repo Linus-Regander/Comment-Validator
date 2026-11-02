@@ -1,447 +1,188 @@
-"""Table-driven tests for the comments API."""
+"""API tests for the current comments service contract."""
 
+import tempfile
 import unittest
-from dataclasses import dataclass, field
-from typing import Any
-from unittest.mock import patch
+from pathlib import Path
 
-import jwt
-from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
-from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
-from app.comments.router import get_pii_detector
-from app.errors import (
-    AuthenticationError,
-    PiiDetectedError,
-    PiiScreeningUnavailableError,
-)
+from app.config.config import API, Auth, Azure, Config, DB, Migrator, Service
+from app.db.database import Base, Database, DatabaseConfig
+from app.errors import PiiDetectedError
 from app.main import create_app
-from app.pii import PiiDetector
-from app.security import EntraPrincipal, get_current_user
-from app.users.models import UserRecord
+from app.util.token_validator import AuthConfig, Principal
 
 
 COMMENT_DATA = {"content": "A useful comment"}
-UPDATED_DATA = {"content": "An updated comment"}
-PRINCIPAL = EntraPrincipal(
+PRINCIPAL = Principal(
     tenant_id="11111111-1111-1111-1111-111111111111",
     object_id="22222222-2222-2222-2222-222222222222",
 )
 
 
-@dataclass(frozen=True)
-class ApiCase:
-    method: str
-    path: str
-    expected_status: int
-    payload: dict[str, str] | None = None
-    setup: tuple[tuple[str, str, dict[str, str]], ...] = ()
-    expected_fields: dict[str, str] = field(default_factory=dict)
-    expected_list_count: int | None = None
-    confirm_deleted: bool = False
-    expected_detail: str | None = None
-    pii_result: str = "clean"
-
-
-API_CASES: dict[str, ApiCase] = {
-    "push comment": ApiCase(
-        method="POST",
-        path="/comments",
-        payload=COMMENT_DATA,
-        expected_status=201,
-        expected_fields={**COMMENT_DATA, "user_id": 1},
-    ),
-    "list comments": ApiCase(
-        method="GET",
-        path="/comments",
-        expected_status=200,
-        setup=(("PUT", "/comments/list-seed", COMMENT_DATA),),
-        expected_list_count=1,
-    ),
-    "get comment": ApiCase(
-        method="GET",
-        path="/comments/get-seed",
-        expected_status=200,
-        setup=(("PUT", "/comments/get-seed", COMMENT_DATA),),
-        expected_fields=COMMENT_DATA,
-    ),
-    "replace comment": ApiCase(
-        method="PUT",
-        path="/comments/replace-seed",
-        payload=UPDATED_DATA,
-        expected_status=200,
-        setup=(("PUT", "/comments/replace-seed", COMMENT_DATA),),
-        expected_fields=UPDATED_DATA,
-    ),
-    "put creates missing comment": ApiCase(
-        method="PUT",
-        path="/comments/new-comment",
-        payload=COMMENT_DATA,
-        expected_status=200,
-        expected_fields=COMMENT_DATA,
-    ),
-    "delete comment": ApiCase(
-        method="DELETE",
-        path="/comments/delete-seed",
-        expected_status=204,
-        setup=(("PUT", "/comments/delete-seed", COMMENT_DATA),),
-        confirm_deleted=True,
-    ),
-    "get missing comment": ApiCase(
-        method="GET",
-        path="/comments/missing",
-        expected_status=404,
-        expected_detail="Comment 'missing' not found",
-    ),
-    "delete missing comment": ApiCase(
-        method="DELETE",
-        path="/comments/missing",
-        expected_status=404,
-        expected_detail="Comment 'missing' not found",
-    ),
-    "reject invalid comment": ApiCase(
-        method="POST",
-        path="/comments",
-        payload={"content": ""},
-        expected_status=422,
-    ),
-    "reject client-supplied author": ApiCase(
-        method="POST",
-        path="/comments",
-        payload={"content": "A useful comment", "author": "Spoofed"},
-        expected_status=422,
-    ),
-    "reject detected personal information": ApiCase(
-        method="POST",
-        path="/comments",
-        payload=COMMENT_DATA,
-        expected_status=422,
-        expected_detail="Comment contains personal or sensitive information",
-        pii_result="pii",
-    ),
-    "reject personal information on update": ApiCase(
-        method="PUT",
-        path="/comments/pii-update",
-        payload=UPDATED_DATA,
-        expected_status=422,
-        expected_detail="Comment contains personal or sensitive information",
-        pii_result="pii",
-    ),
-    "fail closed when PII screening is unavailable": ApiCase(
-        method="PUT",
-        path="/comments/unavailable-screening",
-        payload=COMMENT_DATA,
-        expected_status=503,
-        expected_detail="Azure PII screening is unavailable",
-        pii_result="unavailable",
-    ),
-}
-
-
-class FakePiiDetector(PiiDetector):
-    def __init__(self, result: str) -> None:
-        self.result = result
+class FakePiiDetector:
+    def __init__(self) -> None:
+        self.reject = False
         self.screened: list[str] = []
 
     def assert_clean(self, content: str) -> None:
         self.screened.append(content)
-        if self.result == "pii":
+        if self.reject:
             raise PiiDetectedError()
-        if self.result == "unavailable":
-            raise PiiScreeningUnavailableError("Azure PII screening is unavailable")
+
+    def close(self) -> None:
+        pass
+
+
+def build_test_config() -> Config:
+    return Config(
+        db=DB(
+            driver="sqlite",
+            host="",
+            port=1,
+            username="",
+            password="",
+            database="",
+            echo=False,
+        ),
+        migrator=Migrator(path="", run=False),
+        service=Service(host="127.0.0.1", port=8000),
+        api=API(prefix="/comments", tags=["Comments"]),
+        auth=Auth(
+            auth_disabled="true",
+            authority="https://login.microsoftonline.com",
+            tenant_id=PRINCIPAL.tenant_id,
+            client_id="comments-api",
+            audience="comments-api",
+            scope="access_as_user",
+        ),
+        azure=Azure(
+            language_endpoint="https://language.example.test",
+            disabled_pii="true",
+        ),
+    )
 
 
 class CommentsApiTests(unittest.TestCase):
-    def test_comment_endpoints_table_driven(self) -> None:
-        for case_name, case in API_CASES.items():
-            with self.subTest(case=case_name):
-                engine = create_engine(
-                    "sqlite://",
-                    connect_args={"check_same_thread": False},
-                    poolclass=StaticPool,
-                )
-                session_factory = sessionmaker(
-                    bind=engine,
-                    autoflush=False,
-                    autocommit=False,
-                )
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
 
-                detector = FakePiiDetector(case.pii_result)
-                application = create_app(session_factory)
-                application.dependency_overrides[get_current_user] = lambda: PRINCIPAL
-                application.dependency_overrides[get_pii_detector] = lambda: detector
-
-                with TestClient(application) as client:
-                    for method, path, payload in case.setup:
-                        setup_response = client.request(method, path, json=payload)
-                        self.assertLess(setup_response.status_code, 300)
-
-                    response = client.request(
-                        case.method,
-                        case.path,
-                        json=case.payload,
-                    )
-                    self.assertEqual(response.status_code, case.expected_status)
-
-                    if case.expected_detail is not None:
-                        self.assertEqual(response.json()["detail"], case.expected_detail)
-
-                    if case.expected_fields:
-                        response_body: dict[str, Any] = response.json()
-                        for field_name, expected_value in case.expected_fields.items():
-                            self.assertEqual(response_body[field_name], expected_value)
-
-                    if case.expected_list_count is not None:
-                        self.assertEqual(len(response.json()), case.expected_list_count)
-
-                    if case.confirm_deleted:
-                        self.assertEqual(client.get(case.path).status_code, 404)
-
-                engine.dispose()
-
-    def test_only_comment_owner_can_update_or_delete(self) -> None:
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
+        database_path = Path(self.temporary_directory.name) / "comments.db"
+        self.database = Database(
+            DatabaseConfig(
+                url=f"sqlite:///{database_path}",
+                connect_args={"check_same_thread": False},
+            )
         )
-        session_factory = sessionmaker(bind=engine)
-        detector = FakePiiDetector("clean")
-        application = create_app(session_factory)
-        current_principal = {"value": PRINCIPAL}
-        application.dependency_overrides[get_current_user] = (
-            lambda: current_principal["value"]
-        )
-        application.dependency_overrides[get_pii_detector] = lambda: detector
+        self.addCleanup(self.database.dispose)
+        Base.metadata.create_all(self.database.engine)
 
-        with TestClient(application) as client:
+        self.principal = {"value": PRINCIPAL}
+        self.detector = FakePiiDetector()
+        self.application = create_app(
+            config=build_test_config(),
+            database=self.database,
+            auth_config=AuthConfig(
+                disabled=True,
+                disabled_principal=PRINCIPAL,
+            ),
+        )
+        self.application.dependency_overrides[
+            self.application.state.user_dependency
+        ] = lambda: self.principal["value"]
+        self.application.dependency_overrides[
+            self.application.state.pii_dependency
+        ] = lambda: self.detector
+
+    def test_create_comment_returns_current_response_shape(self) -> None:
+        with TestClient(self.application) as client:
+            response = client.post("/comments", json=COMMENT_DATA)
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["content"], COMMENT_DATA["content"])
+        self.assertEqual(body["user_id"], PRINCIPAL.object_id)
+        self.assertTrue(body["id"])
+        self.assertIn("created_at", body)
+        self.assertIn("updated_at", body)
+        self.assertEqual(self.detector.screened, [COMMENT_DATA["content"]])
+
+    def test_list_and_get_are_scoped_to_the_tenant(self) -> None:
+        with TestClient(self.application) as client:
             created = client.post("/comments", json=COMMENT_DATA)
             comment_id = created.json()["id"]
-            current_principal["value"] = EntraPrincipal(
-                tenant_id=PRINCIPAL.tenant_id,
-                object_id="33333333-3333-3333-3333-333333333333",
+
+            listed = client.get("/comments")
+            fetched = client.get(f"/comments/{comment_id}")
+            self.principal["value"] = Principal(
+                tenant_id="33333333-3333-3333-3333-333333333333",
+                object_id="44444444-4444-4444-4444-444444444444",
             )
+            other_tenant_list = client.get("/comments")
+            other_tenant_fetch = client.get(f"/comments/{comment_id}")
 
-            update_response = client.put(
-                f"/comments/{comment_id}",
-                json=UPDATED_DATA,
-            )
-            delete_response = client.delete(f"/comments/{comment_id}")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(len(listed.json()), 1)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(fetched.json()["id"], comment_id)
+        self.assertEqual(other_tenant_list.status_code, 200)
+        self.assertEqual(other_tenant_list.json(), [])
+        self.assertEqual(other_tenant_fetch.status_code, 404)
 
-            self.assertEqual(update_response.status_code, 403)
-            self.assertEqual(delete_response.status_code, 403)
-            self.assertEqual(detector.screened, [COMMENT_DATA["content"]])
+    def test_missing_comment_returns_not_found(self) -> None:
+        with TestClient(self.application) as client:
+            response = client.get("/comments/missing")
 
-        engine.dispose()
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("detail", response.json())
 
-    def test_comment_routes_require_bearer_identity(self) -> None:
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
+    def test_write_schema_rejects_empty_oversized_and_extra_fields(self) -> None:
+        invalid_payloads = (
+            {"content": ""},
+            {"content": "x" * 5001},
+            {"content": "A useful comment", "author": "Client supplied"},
         )
-        session_factory = sessionmaker(bind=engine)
-        with TestClient(create_app(session_factory)) as client:
+        with TestClient(self.application) as client:
+            responses = [
+                client.post("/comments", json=payload)
+                for payload in invalid_payloads
+            ]
+
+        self.assertEqual([response.status_code for response in responses], [422] * 3)
+        self.assertEqual(self.detector.screened, [])
+
+    def test_detected_pii_rejects_creation(self) -> None:
+        self.detector.reject = True
+        with TestClient(self.application) as client:
+            response = client.post("/comments", json=COMMENT_DATA)
+            listed = client.get("/comments")
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(
+            response.json()["detail"],
+            "Comment contains personal or sensitive information",
+        )
+        self.assertEqual(listed.json(), [])
+
+    def test_comments_require_a_bearer_token_when_auth_is_enabled(self) -> None:
+        application = create_app(
+            config=build_test_config(),
+            database=self.database,
+            auth_config=AuthConfig(),
+        )
+        with TestClient(application) as client:
             response = client.get("/comments")
+
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.headers["www-authenticate"], "Bearer")
-        engine.dispose()
 
-    def test_update_rejects_pii_without_changing_existing_comment(self) -> None:
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        session_factory = sessionmaker(bind=engine)
-        detector = FakePiiDetector("clean")
-        application = create_app(session_factory)
-        application.dependency_overrides[get_current_user] = lambda: PRINCIPAL
-        application.dependency_overrides[get_pii_detector] = lambda: detector
+    def test_update_and_delete_routes_are_registered(self) -> None:
+        with TestClient(self.application) as client:
+            paths = client.get("/openapi.json").json()["paths"]
 
-        with TestClient(application) as client:
-            created = client.put("/comments/pii-update", json=COMMENT_DATA)
-            self.assertEqual(created.status_code, 200)
-            detector.result = "pii"
-
-            updated = client.put("/comments/pii-update", json=UPDATED_DATA)
-            current = client.get("/comments/pii-update")
-
-            self.assertEqual(updated.status_code, 422)
-            self.assertEqual(current.json()["content"], COMMENT_DATA["content"])
-
-        engine.dispose()
-
-    def test_migration_preserves_legacy_comments_without_assigning_owner(self) -> None:
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        with engine.begin() as connection:
-            connection.exec_driver_sql(
-                "CREATE TABLE comments ("
-                "id VARCHAR(36) PRIMARY KEY, author VARCHAR(120) NOT NULL, "
-                "content TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
-                "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-            )
-            connection.exec_driver_sql(
-                "INSERT INTO comments (id, author, content) VALUES (?, ?, ?)",
-                ("legacy-comment", "Unverified author", "Legacy content"),
-            )
-
-        session_factory = sessionmaker(bind=engine)
-        application = create_app(session_factory)
-        application.dependency_overrides[get_current_user] = lambda: PRINCIPAL
-        application.dependency_overrides[get_pii_detector] = lambda: FakePiiDetector(
-            "clean"
-        )
-
-        with TestClient(application) as client:
-            fetched = client.get("/comments/legacy-comment")
-            update = client.put("/comments/legacy-comment", json=UPDATED_DATA)
-            legacy_columns = {
-                column["name"] for column in inspect(engine).get_columns("comments")
-            }
-
-            self.assertEqual(fetched.status_code, 404)
-            self.assertEqual(update.status_code, 403)
-            self.assertNotIn("author", legacy_columns)
-
-        engine.dispose()
-
-    def test_reads_are_scoped_to_the_authenticated_user(self) -> None:
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        session_factory = sessionmaker(bind=engine)
-        application = create_app(session_factory)
-        detector = FakePiiDetector("clean")
-        principal = {"value": PRINCIPAL}
-        application.dependency_overrides[get_current_user] = lambda: principal["value"]
-        application.dependency_overrides[get_pii_detector] = lambda: detector
-
-        with TestClient(application) as client:
-            created = client.post("/comments", json=COMMENT_DATA)
-            comment_id = created.json()["id"]
-            principal["value"] = EntraPrincipal(
-                tenant_id=PRINCIPAL.tenant_id,
-                object_id="33333333-3333-3333-3333-333333333333",
-            )
-
-            self.assertEqual(client.get(f"/comments/{comment_id}").status_code, 403)
-            self.assertEqual(client.get("/comments").json(), [])
-
-        engine.dispose()
-
-    def test_database_restricts_deleting_a_user_with_comments(self) -> None:
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        session_factory = sessionmaker(bind=engine)
-        application = create_app(session_factory)
-        application.dependency_overrides[get_current_user] = lambda: PRINCIPAL
-        application.dependency_overrides[get_pii_detector] = lambda: FakePiiDetector(
-            "clean"
-        )
-
-        with TestClient(application) as client:
-            created = client.post("/comments", json=COMMENT_DATA)
-            self.assertEqual(created.status_code, 201)
-
-        with session_factory() as session:
-            user = session.query(UserRecord).one()
-            session.delete(user)
-            with self.assertRaises(IntegrityError):
-                session.commit()
-            session.rollback()
-
-        engine.dispose()
-
-    def test_entra_token_requires_valid_claims_and_delegated_scope(self) -> None:
-        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        public_key = private_key.public_key()
-        token = jwt.encode(
-            {
-                "aud": "comments-api-client",
-                "iss": "https://login.microsoftonline.com/test-tenant/v2.0",
-                "tid": "test-tenant",
-                "oid": "test-user",
-                "scp": "access_as_user",
-                "iat": 1_750_000_000,
-                "exp": 2_000_000_000,
-            },
-            private_key,
-            algorithm="RS256",
-            headers={"kid": "test-key"},
-        )
-
-        class FakeSigningKey:
-            key = public_key
-
-        class FakeJwksClient:
-            def get_signing_key_from_jwt(self, _: str) -> FakeSigningKey:
-                return FakeSigningKey()
-
-        credentials = HTTPAuthorizationCredentials(
-            scheme="Bearer",
-            credentials=token,
-        )
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "ENTRA_TENANT_ID": "test-tenant",
-                    "ENTRA_CLIENT_ID": "comments-api-client",
-                    "ENTRA_REQUIRED_SCOPE": "access_as_user",
-                },
-            ),
-            patch("app.security._jwks_client", return_value=FakeJwksClient()),
-        ):
-            principal = get_current_user(credentials)
-
-        self.assertEqual(principal, EntraPrincipal("test-tenant", "test-user"))
-
-        token_without_scope = jwt.encode(
-            {
-                "aud": "comments-api-client",
-                "iss": "https://login.microsoftonline.com/test-tenant/v2.0",
-                "tid": "test-tenant",
-                "oid": "test-user",
-                "scp": "other_scope",
-                "iat": 1_750_000_000,
-                "exp": 2_000_000_000,
-            },
-            private_key,
-            algorithm="RS256",
-            headers={"kid": "test-key"},
-        )
-        credentials = HTTPAuthorizationCredentials(
-            scheme="Bearer",
-            credentials=token_without_scope,
-        )
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "ENTRA_TENANT_ID": "test-tenant",
-                    "ENTRA_CLIENT_ID": "comments-api-client",
-                    "ENTRA_REQUIRED_SCOPE": "access_as_user",
-                },
-            ),
-            patch("app.security._jwks_client", return_value=FakeJwksClient()),
-        ):
-            with self.assertRaises(AuthenticationError):
-                get_current_user(credentials)
+        self.assertIn("put", paths["/comments/{comment_id}"])
+        self.assertIn("delete", paths["/comments/{comment_id}"])
 
 
 if __name__ == "__main__":

@@ -1,87 +1,73 @@
-"""Business operations for comments."""
-
 from uuid import uuid4
+
+from dataclasses import dataclass
 
 from app.comments.models import CommentRecord
 from app.comments.repository import CommentRepository
 from app.comments.schemas import CommentWrite
-from app.errors import CommentForbiddenError, CommentNotFoundError
-from app.pii import PiiDetector
-from app.security import EntraPrincipal
+from app.errors import ForbiddenError, InvalidArgumentError, NotFoundError
+from app.util.azure.pii import PiiDetector
+from app.util.token_validator import Principal
 
+ENTITY_NOT_FOUND = NotFoundError("Could not find entity")
+ENTITY_FORBIDDEN_ACCESS = ForbiddenError("Caller does not have permission to access this entity")
+
+@dataclass(frozen=True)
+class ServiceConfig:
+    repository: CommentRepository
+    pii_detector: PiiDetector
 
 class CommentsService:
-    """Apply comment operations using the repository layer."""
+    def __init__(self, config: ServiceConfig) -> None:
+        self._repository = config.repository
+        self._pii_detector = config.pii_detector
 
-    def __init__(self, repository: CommentRepository, pii_detector: PiiDetector) -> None:
-        self._repository = repository
-        self._pii_detector = pii_detector
+    def get_comments(self, user: Principal) -> list[CommentRecord]:
+        return self._repository.list_all(user=user)
 
-    def list_comments(
-        self,
-        principal: EntraPrincipal,
-        skip: int = 0,
-        limit: int = 100,
-    ) -> list[CommentRecord]:
-        return self._repository.list(principal=principal, skip=skip, limit=limit)
+    def get_comment(self, comment_id: str, user: Principal) -> CommentRecord:
+        record = self._repository.get(comment_id, user.tenant_id)
+        if record is None:
+            raise NotFoundError(ENTITY_NOT_FOUND)
+        
+        return record
 
-    def get_comment(self, comment_id: str, principal: EntraPrincipal) -> CommentRecord:
-        comment = self._repository.get(comment_id)
-        if comment is None or comment.user is None:
-            raise CommentNotFoundError(comment_id)
-        if (
-            comment.user.tenant_id != principal.tenant_id
-            or comment.user.entra_object_id != principal.object_id
-        ):
-            raise CommentForbiddenError("Only the comment owner can read it")
-        return comment
-
-    def push_comment(
-        self,
-        data: CommentWrite,
-        principal: EntraPrincipal,
-    ) -> CommentRecord:
+    def add_comment(self, data: CommentWrite, user: Principal) -> CommentRecord:
         self._pii_detector.assert_clean(data.content)
-        user = self._repository.get_or_create_user(principal)
-        comment = CommentRecord(
+
+        return self._repository.save(CommentRecord(
             id=str(uuid4()),
             content=data.content,
-            user=user,
-        )
-        return self._repository.save(comment)
+            tenant_id=user.tenant_id,
+            object_id=user.object_id,
+        ))
 
-    def put_comment(
-        self,
-        comment_id: str,
-        data: CommentWrite,
-        principal: EntraPrincipal,
-    ) -> CommentRecord:
-        comment = self._repository.get(comment_id)
-        if comment is not None and (
-            comment.user is None
-            or comment.user.tenant_id != principal.tenant_id
-            or comment.user.entra_object_id != principal.object_id
-        ):
-            raise CommentForbiddenError("Only the comment owner can update it")
+    def update_comment(self, comment_id: str, data: CommentWrite, user: Principal) -> CommentRecord:
+        comment = self._repository.get(comment_id=comment_id)
+        if comment is None:
+            raise ENTITY_NOT_FOUND
+
+        if comment.object_id is None or comment.object_id != user.object_id:
+            raise ENTITY_FORBIDDEN_ACCESS
+
+        if comment.tenant_id is None or comment.tenant_id != user.tenant_id:
+            raise ENTITY_FORBIDDEN_ACCESS
 
         self._pii_detector.assert_clean(data.content)
-        user = self._repository.get_or_create_user(principal)
-        if comment is None:
-            comment = CommentRecord(
-                id=comment_id,
-                content=data.content,
-                user=user,
-            )
-        else:
-            comment.content = data.content
+
+        comment.content = data.content
+        
         return self._repository.save(comment)
 
-    def delete_comment(self, comment_id: str, principal: EntraPrincipal) -> None:
-        comment = self.get_comment(comment_id, principal)
-        if (
-            comment.user is None
-            or comment.user.tenant_id != principal.tenant_id
-            or comment.user.entra_object_id != principal.object_id
-        ):
-            raise CommentForbiddenError("Only the comment owner can delete it")
+    def delete_comment(self, comment_id: str, user: Principal) -> None:
+        comment = self._repository.get(comment_id=comment_id)
+        if comment is None:
+            raise ENTITY_NOT_FOUND
+        
+        if comment.object_id is None or comment.object_id != user.object_id:
+            raise ENTITY_FORBIDDEN_ACCESS
+
+        if comment.tenant_id is None or comment.tenant_id != user.tenant_id:
+            raise ENTITY_FORBIDDEN_ACCESS
+        
         self._repository.delete(comment)
