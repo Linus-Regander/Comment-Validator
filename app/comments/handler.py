@@ -1,46 +1,61 @@
-"""Translate request operations into service calls."""
+from collections.abc import Callable
 
-from app.comments.models import CommentRecord
-from app.comments.schemas import CommentWrite
+from fastapi import APIRouter, Depends, Response, status
+
+from app.comments.schemas import CommentRead, CommentWrite
 from app.comments.service import CommentsService
-from app.security import EntraPrincipal
+from app.util.token_validator import Principal
 
 
 class CommentsHandler:
-    """Handle request operations and map domain errors to HTTP responses."""
-
-    def __init__(self, service: CommentsService) -> None:
-        self._service = service
-
-    def list_comments(
+    def __init__(
         self,
-        principal: EntraPrincipal,
-        skip: int,
-        limit: int,
-    ) -> list[CommentRecord]:
-        return self._service.list_comments(principal, skip=skip, limit=limit)
+        service: Callable[..., CommentsService],
+        user: Callable[..., Principal],
+        prefix: str,
+        tags: list[str],
+    ) -> None:
+        self.router = APIRouter(prefix=prefix, tags=tags)
+        router = self.router
 
-    def get_comment(
-        self,
-        comment_id: str,
-        principal: EntraPrincipal,
-    ) -> CommentRecord:
-        return self._service.get_comment(comment_id, principal)
+        @router.get("", response_model=list[CommentRead])
+        def get_comments(
+            svc: CommentsService = Depends(service),
+            user: Principal = Depends(user),
+        ):
+            return svc.get_comments(user=user)
 
-    def push_comment(
-        self,
-        data: CommentWrite,
-        principal: EntraPrincipal,
-    ) -> CommentRecord:
-        return self._service.push_comment(data, principal)
+        @router.get("/{comment_id}", response_model=CommentRead)
+        def get_comment(
+            comment_id: str,
+            svc: CommentsService = Depends(service),
+            user: Principal = Depends(user),
+        ):
+            ## TODO: ADD TENANT ISOLATION.
+            return svc.get_comment(comment_id=comment_id, user=user)
 
-    def put_comment(
-        self,
-        comment_id: str,
-        data: CommentWrite,
-        principal: EntraPrincipal,
-    ) -> CommentRecord:
-        return self._service.put_comment(comment_id, data, principal)
+        @router.post("", response_model=CommentRead, status_code=status.HTTP_201_CREATED)
+        def add_comment(
+            data: CommentWrite,
+            svc: CommentsService = Depends(service),
+            user: Principal = Depends(user),
+        ):
+            return svc.add_comment(data=data, user=user)
 
-    def delete_comment(self, comment_id: str, principal: EntraPrincipal) -> None:
-        self._service.delete_comment(comment_id, principal)
+        @router.put("/{comment_id}", response_model=CommentRead)
+        def update_comment(
+            comment_id: str,
+            data: CommentWrite,
+            svc: CommentsService = Depends(service),
+            user: Principal = Depends(user),
+        ):
+            return svc.update_comment(comment_id=comment_id, data=data, user=user)
+
+        @router.delete("/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+        def delete_comment(
+            comment_id: str,
+            svc: CommentsService = Depends(service),
+            user: Principal = Depends(user),
+        ):
+            svc.delete_comment(comment_id=comment_id, user=user)
+            return Response(status_code=status.HTTP_204_NO_CONTENT)

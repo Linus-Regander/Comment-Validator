@@ -1,7 +1,8 @@
-.PHONY: all help install test run docker-build up down logs terraform-init terraform-fmt terraform-validate terraform-plan terraform-apply
+.PHONY: all help install test run migrate db docker-build up down logs terraform-init terraform-fmt terraform-validate terraform-plan terraform-apply
 
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
+LOAD_ENV = set -a && . ./.env && set +a
 
 all: test
 
@@ -9,7 +10,9 @@ help:
 	@printf '%s\n' \
 	  'install       Install application and development dependencies' \
 	  'test          Run the unit and API tests' \
-	  'run           Start the API locally (SQLite by default)' \
+	  'db            Start only the local MariaDB container' \
+	  'migrate       Create the tables in the configured database' \
+	  'run           Start the API locally with auto-reload (uses .env)' \
 	  'docker-build  Build the API image' \
 	  'up            Start the API and MariaDB with Docker Compose' \
 	  'down          Stop the Compose services' \
@@ -24,14 +27,11 @@ install:
 test: install
 	$(PYTHON) -m pytest -q
 
-run: install
-	$(PYTHON) -m uvicorn app.main:app --reload
-
-docker-build:
+build:
 	docker compose build api
 
-up:
-	docker compose up --build -d
+run: build
+	docker compose up
 
 down:
 	docker compose down

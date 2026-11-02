@@ -1,129 +1,126 @@
 # Comment-Validator
 
-## Tech Stack
-
-| Category | Tools |
-|---|---|
-| Language | **Python 3.12** |
-| Framework | **FastAPI**, Pydantic |
-| Data Layer | SQLAlchemy, Alembic, **MariaDB**, SQLite (local development) |
-| Identity & Access | **Microsoft Entra ID**, JWT bearer tokens |
-| Privacy | **Azure AI Language** PII detection |
-| Infrastructure | **Terraform**, Azure managed identity, private endpoint and DNS |
-| Containers | **Docker**, Docker Compose |
-| CI/CD (GitHub) | **GitHub Actions**, Copilot project agent |
+A Python 3.12 FastAPI service for storing comments in MariaDB. The API uses
+SQLAlchemy, validates Entra bearer tokens, and is configured through
+environment variables.
 
 ## Comments API
 
-Layered FastAPI service for creating, reading, replacing, and deleting comments.
+The API is mounted at the configured `API_URL_PREFIX`, set to `/comments` in
+the configuration example below. Its request body for create and replace
+operations is:
 
-- `GET /comments` lists comments; `GET /comments/{comment_id}` reads one.
-- `POST /comments` creates a comment (push).
-- `PUT /comments/{comment_id}` creates or replaces a comment.
-- `DELETE /comments/{comment_id}` removes a comment.
-- Expected application errors are centrally mapped to HTTP status codes; a missing comment returns `404`.
-- All comment routes require an Entra v2 bearer token. The API stores the caller's tenant/object IDs and associates comments with that user; users can only update or delete their own comments.
-- Create and update operations send the comment text to Azure AI Language PII detection before writing. Detected PII returns `422`; unavailable screening fails closed with `503`.
+```json
+{"content": "A useful comment"}
+```
 
-### Run Locally
+`content` must contain 1–5000 characters. Additional request fields are
+rejected. Successful comment responses contain `id`, `content`, `user_id`,
+`created_at`, and `updated_at`. `user_id` is the caller's Entra object ID;
+the database also stores the tenant ID for tenant isolation.
 
-Install dependencies and tests, then configure Entra and Azure Language before starting the service:
+| Method | Path | Purpose | Declared success |
+|---|---|---|---|
+| `GET` | `/comments` | List comments in the caller's tenant | `200` |
+| `GET` | `/comments/{comment_id}` | Get a comment in the caller's tenant | `200` |
+| `POST` | `/comments` | Create a comment | `201` |
+| `PUT` | `/comments/{comment_id}` | Replace an existing comment | `200` |
+| `DELETE` | `/comments/{comment_id}` | Delete a comment | `204` |
+
+Reads are scoped to the caller's tenant. Update and delete are intended to
+require both the caller's tenant ID and object ID to match the comment owner.
+The current service calls the repository's `get` method without its required
+tenant ID for both operations, so `PUT` and `DELETE` currently fail at runtime.
+Those endpoints are listed in the OpenAPI schema but are not yet usable.
+
+Expected API errors are returned as `{"detail": "..."}` responses. Missing
+comments return `404`; invalid request bodies and detected PII return `422`;
+unauthenticated requests return `401`; and access denials return `403`.
+
+Authentication is enabled by default. The API validates the token signature,
+issuer, audience, lifetime, tenant, object ID, and configured delegated scope.
+Set `APPLICATION_AUTH_DISABLED=true` only for local development or tests; this
+mode uses a fixed development identity and is not suitable for deployment.
+
+PII screening is enabled by default and is intended to use Azure AI Language.
+The current Azure detector configuration is incomplete, so enabled screening
+fails closed with `503`. Set `APPLICATION_PII_DISABLED=true` only for local
+development or tests. The Azure endpoint remains a required configuration
+value even when screening is disabled.
+
+## Configuration
+
+Create a local `.env` file (do not commit it) with the following values:
+
+```dotenv
+DB_DRIVER=mysql+pymysql
+DB_HOST=db
+DB_PORT=3306
+DB_USERNAME=comments
+DB_PASSWORD=<database-password>
+DB_DATABASE=comments
+DB_ECHO=false
+DB_MIGRATIONS_PATH=/app/app/sql
+DB_RUN_MIGRATIONS=true
+
+SERVICE_HOST=0.0.0.0
+SERVICE_PORT=8000
+API_URL_PREFIX=/comments
+API_TAGS=Comments
+
+APPLICATION_AUTH_DISABLED=true
+APPLICATION_AUTHORITY=https://login.microsoftonline.com
+APPLICATION_TENANT_ID=<tenant-id>
+APPLICATION_CLIENT_ID=<api-client-id>
+APPLICATION_API_AUDIENCE=<api-audience>
+APPLICATION_API_SCOPE=access_as_user
+
+APPLICATION_PII_DISABLED=true
+AZURE_LANGUAGE_ENDPOINT=https://<language-resource>.cognitiveservices.azure.com/
+
+MARIADB_ROOT_PASSWORD=<database-root-password>
+```
+
+`DB_HOST`, `DB_PORT`, `DB_MIGRATIONS_PATH`, and `SERVICE_HOST` are set for the
+API container by Docker Compose. The API configuration still requires their
+values to be present in its environment, so set them in `.env` as shown.
+Authentication and PII disable flags should be `false` in a deployment, once
+the corresponding service configuration is ready.
+
+## Run and Test
+
+Start the API and MariaDB with Docker Compose:
+
+```bash
+make run
+```
+
+This builds the API image and starts both services. The API listens at
+`http://localhost:8000`; interactive API documentation is at
+`http://localhost:8000/docs`. Stop the services with `make down` and view logs
+with `make logs`.
+
+Install the development dependencies and run the test suite with:
 
 ```bash
 make install
 make test
-export ENTRA_TENANT_ID='<tenant-id>'
-export ENTRA_CLIENT_ID='<api-client-id>'
-export ENTRA_API_AUDIENCE='<api-client-id>'
-export AZURE_LANGUAGE_ENDPOINT='https://<language-resource>.cognitiveservices.azure.com/'
-make run
 ```
 
-The API documentation is available at `http://localhost:8000/docs`.
-Entra validation uses the tenant's published signing keys and validates issuer,
-audience, signature, token lifetime, and the `access_as_user` delegated scope.
-The client must request an access token for the Terraform-provisioned scope.
-Azure SDK credentials use
-`DefaultAzureCredential`; locally this can use Azure CLI login, while deployed
-workloads should use the provisioned user-assigned managed identity.
+The API tests use an isolated SQLite database and inject test identity and PII
+screening dependencies. Database schema changes are plain SQL files in
+`app/sql`; startup applies them when `DB_RUN_MIGRATIONS=true`.
 
-Database changes run through Alembic at startup. The identity migration removes
-the old client-provided `author` column and leaves existing comments unowned;
-those legacy comments remain readable but cannot be updated or deleted through
-the owner-only endpoints. New comments store only a foreign key to the minimal
-Entra user record (tenant ID and object ID).
+## CI
 
-To use MariaDB outside Compose, set `DATABASE_URL`, for example:
-
-```bash
-export DATABASE_URL='mysql+pymysql://user:password@localhost:3306/comments'
-make run
-```
-
-### Run With Docker
-
-Docker Compose starts the API and a MariaDB database. The API is bound to
-`127.0.0.1:8000`:
-
-```bash
-make up
-make logs
-make down
-```
-
-Local Compose credentials can be overridden using `MARIADB_DATABASE`,
-`MARIADB_USER`, `MARIADB_PASSWORD`, and `MARIADB_ROOT_PASSWORD` environment
-variables or a local `.env` file. Set `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`,
-`ENTRA_API_AUDIENCE`, and `AZURE_LANGUAGE_ENDPOINT` there as well. The Azure
-workload identity requires the container runtime to expose its federated/
-managed identity credentials; do not pass client secrets in Compose.
-
-### Azure Provisioning
-
-Terraform provisions a single-tenant Entra API registration and `access_as_user`
-scope, an Azure AI Language resource with local key authentication disabled, and
-a user-assigned managed identity with the `Cognitive Services User` role. It
-also provisions a VNet, private endpoint, and private DNS link for Language;
-public network access is disabled by default. Deploy the API into a subnet with
-access to this VNet and attach the managed identity before enabling production
-traffic. Local Compose cannot access this private endpoint unless its host is
-connected to the VNet, for example through a VPN.
-
-```bash
-export ARM_SUBSCRIPTION_ID='<subscription-id>'
-az login
-make terraform-init
-make terraform-fmt
-make terraform-validate
-make terraform-plan
-make terraform-apply
-terraform -chdir=infra/terraform output
-```
-
-Terraform state contains Azure resource identifiers and must be stored in a
-protected remote backend for team use; do not commit state or plan files. To
-temporarily permit public access for development, explicitly set
-`public_network_access_enabled=true`; do not use that setting for production.
-PII detection is a preventive control, not a determination of
-GDPR compliance. Provide a privacy notice and lawful basis, minimize retention,
-and assess false positives and false negatives for your data and locales.
-
-### CI/CD
-
-GitHub Actions runs the test suite and builds the Docker image on pushes to
-`main`, pull requests, and manual runs. Pushing a version tag such as `v1.0.0`
-also publishes `ghcr.io/<owner>/<repository>:v1.0.0`.
-
-The repository includes a Copilot project agent at
-`.github/agents/comments-api.agent.md` for architecture, security, and validation
-conventions.
-
-### Disclaimer
-This project is building using an agent of Visual Studio Code.
+GitHub Actions runs the Python tests, validates the Terraform configuration,
+and builds/publishes the container image for the configured branches and
+version tags.
 
 <div align="center">
 
 **Developed by** Linus Regander
-**Latest update:** 2026-10-23
+
+**Latest update:** 2026-11-02
 
 </div>

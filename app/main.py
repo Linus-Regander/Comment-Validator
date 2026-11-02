@@ -1,47 +1,79 @@
-"""FastAPI application entry point."""
-
-from collections.abc import Generator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 
-from alembic import command
-from alembic.config import Config
-from fastapi import FastAPI
-from sqlalchemy.orm import Session, sessionmaker
+from fastapi import Depends, FastAPI
+from sqlalchemy.orm import Session
 
-from app.comments import models as _comment_models
-from app.comments.router import close_pii_detector, router as comments_router
-from app.database import Base, SessionLocal, _enable_sqlite_foreign_keys, get_db
+from app.comments.handler import CommentsHandler
+from app.comments.repository import CommentRepository
+from app.comments.service import CommentsService, ServiceConfig
+from app.config.config import Config, setup
+from app.db.database import Database, DatabaseConfig
+from app.db.migrate import apply_migrations
 from app.errors import APIError, api_error_handler
-from app.users import models as _user_models
+from app.util.azure.pii import AzurePiiDetector, NoopPiiDetector, PiiDetector
+from app.util.token_validator import AuthConfig, TokenValidator
 
+API_NAME = "Comments API"
 
-def create_app(session_factory: sessionmaker[Session] = SessionLocal) -> FastAPI:
-    """Create the API application with an injectable database session factory."""
-    bind = session_factory.kw["bind"]
-    _enable_sqlite_foreign_keys(bind)
+def create_app(config: Config | None = None,database: Database | None = None,auth_config: AuthConfig | None = None) -> FastAPI:
+    config = config or setup()
+    database = database or Database(
+        DatabaseConfig(url=config.db.url, echo=config.db.echo)
+    )
+
+    @lru_cache(maxsize=1)
+    def get_pii_detector() -> AzurePiiDetector:
+        if config.azure.pii_disabled:
+            return NoopPiiDetector()
+        
+        return AzurePiiDetector(endpoint=config.azure.language_endpoint)
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> Generator[None, None, None]:
-        migration_config = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
-        with bind.begin() as connection:
-            migration_config.attributes["connection"] = connection
-            command.upgrade(migration_config, "head")
+    async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+        if config.migrator.run:
+            with database.engine.begin() as connection:
+                apply_migrations(connection, Path(config.migrator.path))
         try:
             yield
         finally:
-            close_pii_detector()
+            if get_pii_detector.cache_info().currsize:
+                get_pii_detector().close()
+            database.dispose()
 
-    application = FastAPI(title="Comments API", lifespan=lifespan)
+    application = FastAPI(title=API_NAME, lifespan=lifespan)
     application.add_exception_handler(APIError, api_error_handler)
 
-    def get_session() -> Generator[Session, None, None]:
-        with session_factory() as session:
-            yield session
+    def get_service(session: Session = Depends(database.get_session), pii_detector: PiiDetector = Depends(get_pii_detector)) -> CommentsService:
+        service_config = ServiceConfig(repository=CommentRepository(session), pii_detector=pii_detector)
 
-    application.dependency_overrides[get_db] = get_session
-    application.include_router(comments_router)
+        return CommentsService(config=service_config)
+
+    token_validator = TokenValidator(
+        auth_config
+        or AuthConfig(
+            disabled=config.auth.disabled,
+            tenant_id=config.auth.tenant_id,
+            audience=config.auth.token_audience,
+            issuer_url=config.auth.issuer_url,
+            jwks_url=config.auth.jwks_url,
+            required_scope=config.auth.scope,
+        )
+    )
+
+    user_dependency = token_validator.get_current_user
+    application.state.user_dependency = user_dependency
+    application.state.pii_dependency = get_pii_detector
+
+    handler = CommentsHandler(
+        service=get_service,
+        user=user_dependency,
+        prefix=config.api.prefix,
+        tags=config.api.tags,
+    )
+
+    application.include_router(handler.router)
+
     return application
-
-
-app = create_app()
