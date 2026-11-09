@@ -53,3 +53,13 @@ terraform-plan: terraform-validate
 
 terraform-apply: terraform-validate
 	terraform -chdir=infra/terraform apply -var="subscription_id=$${ARM_SUBSCRIPTION_ID:?Set ARM_SUBSCRIPTION_ID}"
+
+terraform-destroy: terraform-validate
+	terraform -chdir=infra/terraform destroy -var="subscription_id=$${ARM_SUBSCRIPTION_ID:?Set ARM_SUBSCRIPTION_ID}"
+
+terraform-destroy-paid: terraform-validate
+	terraform -chdir=infra/terraform destroy \
+	  -target=azurerm_linux_web_app.api \
+	  -target=azurerm_service_plan.comments \
+	  -target=azurerm_cognitive_account.language \
+	  -var="subscription_id=$${ARM_SUBSCRIPTION_ID:?Set ARM_SUBSCRIPTION_ID}"
