@@ -9,8 +9,10 @@ resource "random_string" "suffix" {
 }
 
 locals {
-  resource_suffix = random_string.suffix.result
-  language_name   = "${var.name_prefix}-${local.resource_suffix}"
+  resource_suffix     = random_string.suffix.result
+  language_name       = "${var.name_prefix}-${local.resource_suffix}"
+  api_scope_id        = "6f1d3c2a-8b4e-4a7d-9c15-2e7b5a9d4f60"
+  azure_cli_client_id = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 }
 
 resource "azurerm_resource_group" "comments" {
@@ -18,24 +20,8 @@ resource "azurerm_resource_group" "comments" {
   location = var.location
 }
 
-resource "azurerm_virtual_network" "comments" {
-  name                = "${var.name_prefix}-vnet-${local.resource_suffix}"
-  location            = azurerm_resource_group.comments.location
-  resource_group_name = azurerm_resource_group.comments.name
-  address_space       = ["10.42.0.0/16"]
-}
-
-resource "azurerm_subnet" "private_endpoints" {
-  name                              = "private-endpoints"
-  resource_group_name               = azurerm_resource_group.comments.name
-  virtual_network_name              = azurerm_virtual_network.comments.name
-  address_prefixes                  = ["10.42.1.0/24"]
-  private_endpoint_network_policies = "Disabled"
-}
-
 resource "azuread_application" "comments_api" {
   display_name     = "${var.name_prefix}-api"
-  identifier_uris  = ["api://${random_uuid.api_application_uri.result}"]
   owners           = [data.azuread_client_config.current.object_id]
   sign_in_audience = "AzureADMyOrg"
 
@@ -46,20 +32,32 @@ resource "azuread_application" "comments_api" {
       admin_consent_description  = "Allow the application to create and manage comments as the signed-in user."
       admin_consent_display_name = "Access comments as the signed-in user"
       enabled                    = true
-      id                         = random_uuid.api_scope.result
+      id                         = local.api_scope_id
       type                       = "User"
       user_consent_description   = "Allow this application to access comments as you."
       user_consent_display_name  = "Access comments as you"
       value                      = "access_as_user"
     }
   }
+
+  lifecycle {
+    ignore_changes = [identifier_uris]
+  }
 }
 
-resource "random_uuid" "api_scope" {}
-resource "random_uuid" "api_application_uri" {}
+resource "azuread_application_identifier_uri" "comments_api" {
+  application_id = azuread_application.comments_api.id
+  identifier_uri = "api://${azuread_application.comments_api.client_id}"
+}
 
 resource "azuread_service_principal" "comments_api" {
   client_id = azuread_application.comments_api.client_id
+}
+
+resource "azuread_application_pre_authorized" "azure_cli" {
+  application_id       = azuread_application.comments_api.id
+  authorized_client_id = local.azure_cli_client_id
+  permission_ids       = [local.api_scope_id]
 }
 
 resource "azurerm_cognitive_account" "language" {
@@ -71,38 +69,7 @@ resource "azurerm_cognitive_account" "language" {
   custom_subdomain_name = local.language_name
 
   local_auth_enabled            = false
-  public_network_access_enabled = var.public_network_access_enabled
-}
-
-resource "azurerm_private_dns_zone" "language" {
-  name                = "privatelink.cognitiveservices.azure.com"
-  resource_group_name = azurerm_resource_group.comments.name
-}
-
-resource "azurerm_private_dns_zone_virtual_network_link" "language" {
-  name                  = "${var.name_prefix}-language-dns-${local.resource_suffix}"
-  resource_group_name   = azurerm_resource_group.comments.name
-  private_dns_zone_name = azurerm_private_dns_zone.language.name
-  virtual_network_id    = azurerm_virtual_network.comments.id
-}
-
-resource "azurerm_private_endpoint" "language" {
-  name                = "${var.name_prefix}-language-pe-${local.resource_suffix}"
-  location            = azurerm_resource_group.comments.location
-  resource_group_name = azurerm_resource_group.comments.name
-  subnet_id           = azurerm_subnet.private_endpoints.id
-
-  private_service_connection {
-    name                           = "${var.name_prefix}-language-connection"
-    private_connection_resource_id = azurerm_cognitive_account.language.id
-    is_manual_connection           = false
-    subresource_names              = ["account"]
-  }
-
-  private_dns_zone_group {
-    name                 = "language-dns"
-    private_dns_zone_ids = [azurerm_private_dns_zone.language.id]
-  }
+  public_network_access_enabled = true
 }
 
 resource "azurerm_user_assigned_identity" "comments_api" {
@@ -116,4 +83,51 @@ resource "azurerm_role_assignment" "language_user" {
   role_definition_name = "Cognitive Services User"
   principal_id         = azurerm_user_assigned_identity.comments_api.principal_id
   principal_type       = "ServicePrincipal"
+}
+
+resource "azurerm_service_plan" "comments" {
+  name                = "${var.name_prefix}-plan-${local.resource_suffix}"
+  location            = azurerm_resource_group.comments.location
+  resource_group_name = azurerm_resource_group.comments.name
+  os_type             = "Linux"
+  sku_name            = "B1"
+}
+
+resource "azurerm_linux_web_app" "api" {
+  name                = "${var.name_prefix}-${local.resource_suffix}"
+  location            = azurerm_resource_group.comments.location
+  resource_group_name = azurerm_resource_group.comments.name
+  service_plan_id     = azurerm_service_plan.comments.id
+  https_only          = true
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.comments_api.id]
+  }
+
+  site_config {
+    always_on = true
+
+    application_stack {
+      docker_image_name   = var.container_image
+      docker_registry_url = "https://index.docker.io"
+    }
+  }
+
+  app_settings = {
+    PORT                                = "8000"
+    WEBSITES_PORT                       = "8000"
+    WEBSITES_ENABLE_APP_SERVICE_STORAGE = "false"
+    WEBSITES_CONTAINER_START_TIME_LIMIT = "600"
+
+    ENTRA_TENANT_ID      = data.azuread_client_config.current.tenant_id
+    ENTRA_CLIENT_ID      = azuread_application.comments_api.client_id
+    ENTRA_API_AUDIENCE   = azuread_application.comments_api.client_id
+    ENTRA_REQUIRED_SCOPE = "access_as_user"
+
+    AZURE_LANGUAGE_ENDPOINT = azurerm_cognitive_account.language.endpoint
+    AZURE_CLIENT_ID         = azurerm_user_assigned_identity.comments_api.client_id
+  }
+
+  depends_on = [azurerm_role_assignment.language_user]
 }

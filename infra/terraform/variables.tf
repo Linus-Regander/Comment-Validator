@@ -1,12 +1,12 @@
 variable "subscription_id" {
-  description = "Azure subscription that will contain the Language resource."
+  description = "Azure subscription that will contain the resources."
   type        = string
 }
 
 variable "location" {
-  description = "Azure region for the resource group and Language resource."
+  description = "Azure region (Sweden Central is the closest to Stockholm)."
   type        = string
-  default     = "eastus"
+  default     = "swedencentral"
 }
 
 variable "name_prefix" {
@@ -20,8 +20,8 @@ variable "name_prefix" {
   }
 }
 
-variable "public_network_access_enabled" {
-  description = "Allow public network access to Azure Language. Keep disabled for workloads attached to the provisioned private network."
-  type        = bool
-  default     = false
+variable "container_image" {
+  description = "Docker Hub image (repository:tag) the web app runs. Must be public."
+  type        = string
+  default     = "lynxelele/comments-api:stable"
 }

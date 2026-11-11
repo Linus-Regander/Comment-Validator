@@ -48,71 +48,6 @@ fails closed with `503`. Set `APPLICATION_PII_DISABLED=true` only for local
 development or tests. The Azure endpoint remains a required configuration
 value even when screening is disabled.
 
-## Configuration
-
-Create a local `.env` file (do not commit it) with the following values:
-
-```dotenv
-DB_DRIVER=mysql+pymysql
-DB_HOST=db
-DB_PORT=3306
-DB_USERNAME=comments
-DB_PASSWORD=<database-password>
-DB_DATABASE=comments
-DB_ECHO=false
-DB_MIGRATIONS_PATH=/app/app/sql
-DB_RUN_MIGRATIONS=true
-
-SERVICE_HOST=0.0.0.0
-SERVICE_PORT=8000
-API_URL_PREFIX=/comments
-API_TAGS=Comments
-
-APPLICATION_AUTH_DISABLED=true
-APPLICATION_AUTHORITY=https://login.microsoftonline.com
-APPLICATION_TENANT_ID=<tenant-id>
-APPLICATION_CLIENT_ID=<api-client-id>
-APPLICATION_API_AUDIENCE=<api-audience>
-APPLICATION_API_SCOPE=access_as_user
-
-APPLICATION_PII_DISABLED=true
-AZURE_LANGUAGE_ENDPOINT=https://<language-resource>.cognitiveservices.azure.com/
-
-MARIADB_ROOT_PASSWORD=<database-root-password>
-```
-
-`DB_HOST`, `DB_PORT`, `DB_MIGRATIONS_PATH`, and `SERVICE_HOST` are set for the
-API container by Docker Compose. The API configuration still requires their
-values to be present in its environment, so set them in `.env` as shown.
-Authentication and PII disable flags should be `false` in a deployment, once
-the corresponding service configuration is ready.
-
-## Run and Test
-
-Start the API and MariaDB with Docker Compose:
-
-```bash
-make run
-```
-
-This builds the API image and starts both services. The API listens at
-`http://localhost:8000`; interactive API documentation is at
-`http://localhost:8000/docs`. Stop the services with `make down` and view logs
-with `make logs`.
-
-Install the development dependencies and run the test suite with:
-
-```bash
-make install
-make test
-```
-
-The API tests use an isolated SQLite database and inject test identity and PII
-screening dependencies. Database schema changes are plain SQL files in
-`app/sql`; startup applies them when `DB_RUN_MIGRATIONS=true`.
-
-## CI
-
 GitHub Actions runs the Python tests, validates the Terraform configuration,
 and builds/publishes the container image for the configured branches and
 version tags.
@@ -121,6 +56,6 @@ version tags.
 
 **Developed by** Linus Regander
 
-**Latest update:** 2026-11-02
+**Latest update:** 2026-11-11
 
 </div>
