@@ -115,19 +115,75 @@ resource "azurerm_linux_web_app" "api" {
   }
 
   app_settings = {
-    PORT                                = "8000"
     WEBSITES_PORT                       = "8000"
     WEBSITES_ENABLE_APP_SERVICE_STORAGE = "false"
     WEBSITES_CONTAINER_START_TIME_LIMIT = "600"
 
-    ENTRA_TENANT_ID      = data.azuread_client_config.current.tenant_id
-    ENTRA_CLIENT_ID      = azuread_application.comments_api.client_id
-    ENTRA_API_AUDIENCE   = azuread_application.comments_api.client_id
-    ENTRA_REQUIRED_SCOPE = "access_as_user"
+    DB_DRIVER          = "mysql+pymysql"
+    DB_HOST            = azurerm_mysql_flexible_server.comments.fqdn
+    DB_PORT            = "3306"
+    DB_USERNAME        = azurerm_mysql_flexible_server.comments.administrator_login
+    DB_PASSWORD        = random_password.db.result
+    DB_DATABASE        = azurerm_mysql_flexible_database.comments.name
+    DB_MIGRATIONS_PATH = "/app/app/sql"
+    DB_RUN_MIGRATIONS  = "true"
+
+    SERVICE_HOST   = "0.0.0.0"
+    SERVICE_PORT   = "8000"
+    API_URL_PREFIX = "/comments"
+    API_TAGS       = "comments"
+
+    APPLICATION_AUTHORITY    = "https://login.microsoftonline.com"
+    APPLICATION_TENANT_ID    = data.azuread_client_config.current.tenant_id
+    APPLICATION_CLIENT_ID    = azuread_application.comments_api.client_id
+    APPLICATION_API_AUDIENCE = azuread_application.comments_api.client_id
+    APPLICATION_API_SCOPE    = "access_as_user"
 
     AZURE_LANGUAGE_ENDPOINT = azurerm_cognitive_account.language.endpoint
     AZURE_CLIENT_ID         = azurerm_user_assigned_identity.comments_api.client_id
   }
 
   depends_on = [azurerm_role_assignment.language_user]
+}
+
+resource "random_password" "db" {
+  length  = 32
+  special = false
+}
+
+resource "azurerm_mysql_flexible_server" "comments" {
+  name                   = "${var.name_prefix}-db-${local.resource_suffix}"
+  resource_group_name    = azurerm_resource_group.comments.name
+  location               = azurerm_resource_group.comments.location
+  administrator_login    = "commentsadmin"
+  administrator_password = random_password.db.result
+  sku_name               = "B_Standard_B1ms"
+  version                = "8.0.21"
+
+  storage {
+    size_gb = 20
+  }
+}
+
+resource "azurerm_mysql_flexible_database" "comments" {
+  name                = "comments"
+  resource_group_name = azurerm_resource_group.comments.name
+  server_name         = azurerm_mysql_flexible_server.comments.name
+  charset             = "utf8mb4"
+  collation           = "utf8mb4_unicode_ci"
+}
+
+resource "azurerm_mysql_flexible_server_firewall_rule" "azure_services" {
+  name                = "allow-azure-services"
+  resource_group_name = azurerm_resource_group.comments.name
+  server_name         = azurerm_mysql_flexible_server.comments.name
+  start_ip_address    = "0.0.0.0"
+  end_ip_address      = "0.0.0.0"
+}
+
+resource "azurerm_mysql_flexible_server_configuration" "secure_transport" {
+  name                = "require_secure_transport"
+  resource_group_name = azurerm_resource_group.comments.name
+  server_name         = azurerm_mysql_flexible_server.comments.name
+  value               = "OFF"
 }
