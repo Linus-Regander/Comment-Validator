@@ -115,7 +115,7 @@ resource "azurerm_linux_web_app" "api" {
   }
 
   app_settings = {
-    PORT          = "8000"
+    PORT                                = "8000"
     WEBSITES_PORT                       = "8000"
     WEBSITES_ENABLE_APP_SERVICE_STORAGE = "false"
     WEBSITES_CONTAINER_START_TIME_LIMIT = "600"
