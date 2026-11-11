@@ -58,7 +58,7 @@ resource "azuread_application_pre_authorized" "azure_cli" {
   application_id       = azuread_application.comments_api.id
   authorized_client_id = local.azure_cli_client_id
   permission_ids       = [local.api_scope_id]
-}a
+}
 
 resource "azurerm_cognitive_account" "language" {
   name                  = local.language_name
@@ -90,7 +90,7 @@ resource "azurerm_service_plan" "comments" {
   location            = azurerm_resource_group.comments.location
   resource_group_name = azurerm_resource_group.comments.name
   os_type             = "Linux"
-  sku_name            = "F1"
+  sku_name            = "B1"
 }
 
 resource "azurerm_linux_web_app" "api" {
@@ -106,8 +106,7 @@ resource "azurerm_linux_web_app" "api" {
   }
 
   site_config {
-    always_on        = false
-    app_command_line = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    always_on = true
 
     application_stack {
       docker_image_name   = var.container_image
@@ -116,8 +115,8 @@ resource "azurerm_linux_web_app" "api" {
   }
 
   app_settings = {
+    PORT          = "8000"
     WEBSITES_PORT                       = "8000"
-    PORT                                = "8000"
     WEBSITES_ENABLE_APP_SERVICE_STORAGE = "false"
     WEBSITES_CONTAINER_START_TIME_LIMIT = "600"
 
