@@ -63,4 +63,5 @@ terraform-destroy-paid: azure-login terraform-validate
 	  -target=azurerm_linux_web_app.api \
 	  -target=azurerm_service_plan.comments \
 	  -target=azurerm_cognitive_account.language \
+	  -target=azurerm_mysql_flexible_server.comments \
 	  $(TF_VARS)
