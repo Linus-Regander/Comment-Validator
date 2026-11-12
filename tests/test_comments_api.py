@@ -45,7 +45,7 @@ def build_test_config() -> Config:
             database="",
             echo=False,
         ),
-        migrator=Migrator(path="", run=False),
+        migrator=Migrator(path="", run=False, use_lock=False),
         service=Service(host="127.0.0.1", port=8000),
         api=API(prefix="/comments", tags=["Comments"]),
         auth=Auth(
@@ -164,6 +164,56 @@ class CommentsApiTests(unittest.TestCase):
             "Comment contains personal or sensitive information",
         )
         self.assertEqual(listed.json(), [])
+
+    def test_owner_can_update_and_delete_comment(self) -> None:
+        updated_content = "Updated comment"
+        with TestClient(self.application) as client:
+            created = client.post("/comments", json=COMMENT_DATA)
+            comment_id = created.json()["id"]
+            updated = client.put(
+                f"/comments/{comment_id}",
+                json={"content": updated_content},
+            )
+            deleted = client.delete(f"/comments/{comment_id}")
+            fetched_after_delete = client.get(f"/comments/{comment_id}")
+
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["content"], updated_content)
+        self.assertEqual(updated.json()["user_id"], PRINCIPAL.object_id)
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(fetched_after_delete.status_code, 404)
+
+    def test_update_and_delete_are_limited_to_comment_owner(self) -> None:
+        with TestClient(self.application) as client:
+            created = client.post("/comments", json=COMMENT_DATA)
+            comment_id = created.json()["id"]
+            self.principal["value"] = Principal(
+                tenant_id=PRINCIPAL.tenant_id,
+                object_id="44444444-4444-4444-4444-444444444444",
+            )
+            forbidden_update = client.put(
+                f"/comments/{comment_id}",
+                json={"content": "Not the owner"},
+            )
+            forbidden_delete = client.delete(f"/comments/{comment_id}")
+            still_present = client.get(f"/comments/{comment_id}")
+
+            self.principal["value"] = Principal(
+                tenant_id="55555555-5555-5555-5555-555555555555",
+                object_id=PRINCIPAL.object_id,
+            )
+            other_tenant_update = client.put(
+                f"/comments/{comment_id}",
+                json={"content": "Other tenant"},
+            )
+            other_tenant_delete = client.delete(f"/comments/{comment_id}")
+
+        self.assertEqual(forbidden_update.status_code, 403)
+        self.assertEqual(forbidden_delete.status_code, 403)
+        self.assertEqual(still_present.status_code, 200)
+        self.assertEqual(still_present.json()["content"], COMMENT_DATA["content"])
+        self.assertEqual(other_tenant_update.status_code, 404)
+        self.assertEqual(other_tenant_delete.status_code, 404)
 
     def test_comments_require_a_bearer_token_when_auth_is_enabled(self) -> None:
         application = create_app(

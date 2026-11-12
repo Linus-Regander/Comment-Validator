@@ -1,8 +1,11 @@
 from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
+import ssl
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from app.config.config import DB
 
 MISSING_URL_ERROR = "Database URL must not be empty"
 
@@ -43,3 +46,22 @@ class Database:
 
     def dispose(self) -> None:
         self._engine.dispose()
+
+#
+## Helper DB functions.
+#
+
+def tls_connect_args(enabled: bool) -> dict[str, object]:
+    if not enabled:
+        return {}
+
+    return {"ssl": ssl.create_default_context()}
+
+def database_from_config(db: DB) -> Database:
+    return Database(
+        DatabaseConfig(
+            url=db.url,
+            echo=db.echo,
+            connect_args=tls_connect_args(db.ssl),
+        )
+    )
