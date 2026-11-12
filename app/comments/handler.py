@@ -31,7 +31,6 @@ class CommentsHandler:
             svc: CommentsService = Depends(service),
             user: Principal = Depends(user),
         ):
-            ## TODO: ADD TENANT ISOLATION.
             return svc.get_comment(comment_id=comment_id, user=user)
 
         @router.post("", response_model=CommentRead, status_code=status.HTTP_201_CREATED)

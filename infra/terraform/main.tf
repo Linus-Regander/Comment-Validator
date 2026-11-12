@@ -125,8 +125,10 @@ resource "azurerm_linux_web_app" "api" {
     DB_USERNAME        = azurerm_mysql_flexible_server.comments.administrator_login
     DB_PASSWORD        = random_password.db.result
     DB_DATABASE        = azurerm_mysql_flexible_database.comments.name
-    DB_MIGRATIONS_PATH = "/app/app/sql"
+    DB_MIGRATIONS_PATH = "/app/app/db/migrations"
     DB_RUN_MIGRATIONS  = "true"
+    DB_SSL             = "true"
+    DB_USE_LOCK        = "true"
 
     SERVICE_HOST   = "0.0.0.0"
     SERVICE_PORT   = "8000"
@@ -143,7 +145,12 @@ resource "azurerm_linux_web_app" "api" {
     AZURE_CLIENT_ID         = azurerm_user_assigned_identity.comments_api.client_id
   }
 
-  depends_on = [azurerm_role_assignment.language_user]
+  depends_on = [
+    azurerm_role_assignment.language_user,
+    azurerm_mysql_flexible_database.comments,
+    azurerm_mysql_flexible_server_firewall_rule.azure_services,
+    azurerm_mysql_flexible_server_configuration.secure_transport,
+  ]
 }
 
 resource "random_password" "db" {
@@ -185,5 +192,5 @@ resource "azurerm_mysql_flexible_server_configuration" "secure_transport" {
   name                = "require_secure_transport"
   resource_group_name = azurerm_resource_group.comments.name
   server_name         = azurerm_mysql_flexible_server.comments.name
-  value               = "OFF"
+  value               = "ON"
 }

@@ -23,12 +23,12 @@ class CommentsService:
         self._pii_detector = config.pii_detector
 
     def get_comments(self, user: Principal) -> list[CommentRecord]:
-        return self._repository.list_all(user=user)
+        return self._repository.list_all(tenant_id=user.tenant_id)
 
     def get_comment(self, comment_id: str, user: Principal) -> CommentRecord:
-        record = self._repository.get(comment_id, user.tenant_id)
+        record = self._repository.get(comment_id, tenant_id=user.tenant_id)
         if record is None:
-            raise NotFoundError(ENTITY_NOT_FOUND)
+            raise ENTITY_NOT_FOUND
         
         return record
 
@@ -43,7 +43,7 @@ class CommentsService:
         ))
 
     def update_comment(self, comment_id: str, data: CommentWrite, user: Principal) -> CommentRecord:
-        comment = self._repository.get(comment_id=comment_id)
+        comment = self._repository.get(comment_id=comment_id, tenant_id=user.tenant_id)
         if comment is None:
             raise ENTITY_NOT_FOUND
 
@@ -60,7 +60,7 @@ class CommentsService:
         return self._repository.save(comment)
 
     def delete_comment(self, comment_id: str, user: Principal) -> None:
-        comment = self._repository.get(comment_id=comment_id)
+        comment = self._repository.get(comment_id=comment_id, tenant_id=user.tenant_id)
         if comment is None:
             raise ENTITY_NOT_FOUND
         

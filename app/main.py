@@ -10,8 +10,8 @@ from app.comments.handler import CommentsHandler
 from app.comments.repository import CommentRepository
 from app.comments.service import CommentsService, ServiceConfig
 from app.config.config import Config, setup
-from app.db.database import Database, DatabaseConfig
-from app.db.migrate import apply_migrations
+from app.db.database import Database, database_from_config
+from app.db.migrate import MigrationRunner
 from app.errors import APIError, api_error_handler
 from app.util.azure.pii import AzurePiiDetector, NoopPiiDetector, PiiDetector
 from app.util.token_validator import AuthConfig, TokenValidator
@@ -20,9 +20,7 @@ API_NAME = "Comments API"
 
 def create_app(config: Config | None = None,database: Database | None = None,auth_config: AuthConfig | None = None) -> FastAPI:
     config = config or setup()
-    database = database or Database(
-        DatabaseConfig(url=config.db.url, echo=config.db.echo)
-    )
+    database = database or database_from_config(config.db)
 
     @lru_cache(maxsize=1)
     def get_pii_detector() -> AzurePiiDetector:
@@ -33,10 +31,14 @@ def create_app(config: Config | None = None,database: Database | None = None,aut
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
-        if config.migrator.run:
-            with database.engine.begin() as connection:
-                apply_migrations(connection, Path(config.migrator.path))
         try:
+            if config.migrator.run:
+                with database.engine.connect() as connection:
+                    MigrationRunner(
+                        connection,
+                        Path(config.migrator.path),
+                        config.migrator.use_lock,
+                    ).run()
             yield
         finally:
             if get_pii_detector.cache_info().currsize:

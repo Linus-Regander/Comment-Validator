@@ -23,6 +23,7 @@ class DB:
     password: str = env("DB_PASSWORD", secret=True)
     database: str = env("DB_DATABASE")
     echo: bool = env("DB_ECHO", optional=True)
+    ssl: bool = field(default=False, metadata={"env": "DB_SSL", "optional": True})
 
     @property
     def url(self) -> str:
@@ -39,6 +40,7 @@ class DB:
 class Migrator:
     path: str = env("DB_MIGRATIONS_PATH")
     run: bool = env("DB_RUN_MIGRATIONS", optional=True)
+    use_lock: bool = env("DB_USE_LOCK", optional=True)
 
 @dataclass(frozen=True)
 class Service:
